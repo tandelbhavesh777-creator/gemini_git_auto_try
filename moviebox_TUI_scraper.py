@@ -1,19 +1,20 @@
 """
-MovieBox catalog scraper -> JSON for an Android streaming app.
+MovieBox catalog scraper -> split <23MB JSON chunks for an Android streaming app.
 
 Reverse-engineered from github.com/mesamirh/MovieBox-TUI (providers/moviebox).
 Replicates: visitor login, HMAC-MD5 request signing, homepage tabs, search
 pagination, details, play-info (signed DASH manifests), resources.
 
 Run:
-    py -m pip install requests
-    py moviebox_scraper.py                 # full run
-    py moviebox_scraper.py --max-titles 25 # quick test run
-    py moviebox_scraper.py --max-titles 25 --fresh   # ignore saved progress
+    pip install requests
+    python moviebox_TUI_scraper.py                 # full run
+    python moviebox_TUI_scraper.py --max-titles 25 # quick test run
+    python moviebox_TUI_scraper.py --max-titles 25 --fresh   # ignore saved progress
 
-Output:
-    C:\Database\moviebox_catalog.json        (final file)
-    C:\Database\moviebox_progress.jsonl      (progress log, resume-safe)
+Output (saved inside repo's output/ folder):
+    output/index.json                (manifest with SHA-256 version_hash)
+    output/catalog_part_1.json       (split chunks capped under 23 MB)
+    output/moviebox_progress.jsonl   (progress log, resume-safe)
 """
 
 import argparse
@@ -25,15 +26,18 @@ import os
 import random
 import re
 import time
-from datetime import datetime
 
 import requests
 
 # ---------------------------------------------------------------- config ----
 
-OUT_DIR = r"C:\Database"
-OUT_FILE = os.path.join(OUT_DIR, "moviebox_catalog.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.path.join(BASE_DIR, "output")
+INDEX_FILE = os.path.join(OUT_DIR, "index.json")
 PROGRESS_FILE = os.path.join(OUT_DIR, "moviebox_progress.jsonl")
+
+# 22.5 MB safe ceiling so every chunk stays strictly under 23 MB
+MAX_CHUNK_BYTES = 22 * 1024 * 1024 + 512 * 1024
 
 HOST_POOL = [
     "https://api6.aoneroom.com",
@@ -759,38 +763,83 @@ def append_progress(entry):
 
 # ---------------------------------------------------------------- main -----
 
-def build_catalog(done):
+def write_catalog(done):
+    """Split collected movies & series into <23MB JSON chunks + index.json inside output/."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+
     movies, series = [], []
     for entry in done.values():
         if entry.get("type") == "series":
             series.append(entry)
         else:
             movies.append(entry)
+
+    all_items = movies + series
+
+    # Remove old split chunk files before writing fresh ones
+    for fname in os.listdir(OUT_DIR):
+        if fname.startswith("catalog_part_") and fname.endswith(".json"):
+            os.remove(os.path.join(OUT_DIR, fname))
+
+    part_num = 1
+    current_chunk = []
+    current_bytes = 2  # '[' and ']'
+    generated_files = []
+    hasher = hashlib.sha256()
+
+    for item in all_items:
+        serialized = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        encoded = serialized.encode("utf-8")
+        hasher.update(encoded)
+        item_len = len(encoded) + 1  # +1 for comma separator
+
+        if current_chunk and (current_bytes + item_len > MAX_CHUNK_BYTES):
+            filename = f"catalog_part_{part_num}.json"
+            tmp_path = os.path.join(OUT_DIR, filename + ".tmp")
+            final_path = os.path.join(OUT_DIR, filename)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(current_chunk, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp_path, final_path)
+            generated_files.append(filename)
+
+            part_num += 1
+            current_chunk = []
+            current_bytes = 2
+
+        current_bytes += item_len
+        current_chunk.append(item)
+
+    if current_chunk:
+        filename = f"catalog_part_{part_num}.json"
+        tmp_path = os.path.join(OUT_DIR, filename + ".tmp")
+        final_path = os.path.join(OUT_DIR, filename)
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(current_chunk, fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, final_path)
+        generated_files.append(filename)
+
+    manifest = {
+        "version_hash": hasher.hexdigest(),
+        "updated_at_epoch": int(time.time()),
+        "total_items": len(all_items),
+        "total_parts": len(generated_files),
+        "files": generated_files,
+    }
+    tmp_index = INDEX_FILE + ".tmp"
+    with open(tmp_index, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_index, INDEX_FILE)
+
     return {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "source": "moviebox",
-        "counts": {
-            "movies": len(movies),
-            "series": len(series),
-            "total": len(movies) + len(series),
-        },
-        "movies": movies,
-        "series": series,
+        "movies": len(movies),
+        "series": len(series),
+        "total": len(all_items),
+        "parts": len(generated_files),
     }
 
 
-def write_catalog(done):
-    catalog = build_catalog(done)
-    os.makedirs(OUT_DIR, exist_ok=True)
-    tmp = OUT_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(catalog, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, OUT_FILE)
-    return catalog["counts"]
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Scrape the MovieBox catalog into JSON.")
+    parser = argparse.ArgumentParser(description="Scrape the MovieBox catalog into <23MB JSON chunks.")
     parser.add_argument("--max-titles", type=int, default=0,
                         help="Stop after N titles (0 = no limit).")
     parser.add_argument("--fresh", action="store_true",
@@ -802,7 +851,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    log(f"output -> {OUT_FILE}")
+    log(f"output folder -> {OUT_DIR}")
 
     if args.fresh and os.path.exists(PROGRESS_FILE):
         os.remove(PROGRESS_FILE)
@@ -853,7 +902,7 @@ def main():
                     remaining -= 1
                     log(f"{entry['title'][:45]} ({entry['type']})")
         counts = write_catalog(done)
-        log(f"done: {counts['movies']} movies, {counts['series']} series -> {OUT_FILE}")
+        log(f"done: {counts['movies']} movies, {counts['series']} series -> {counts['parts']} chunks in {OUT_DIR}")
         return 0
 
     # 1. gather subject ids from homepage tabs + search seeds
@@ -944,12 +993,12 @@ def main():
         # checkpoint the catalog every 25 titles so a crash leaves a usable file
         if i % 25 == 0:
             counts = write_catalog(done)
-            log(f"  checkpoint: {counts['total']} titles written")
+            log(f"  checkpoint: {counts['total']} titles written across {counts['parts']} chunks")
 
         time.sleep(REQUEST_DELAY)
 
     counts = write_catalog(done)
-    log(f"done: {counts['movies']} movies, {counts['series']} series -> {OUT_FILE}")
+    log(f"done: {counts['movies']} movies, {counts['series']} series -> {counts['parts']} chunks in {OUT_DIR}")
     return 0
 
 
