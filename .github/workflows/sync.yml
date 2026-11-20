@@ -1,0 +1,50 @@
+name: Sync MovieBox Catalog JSON
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      max_titles:
+        description: 'Max titles to fetch (0 = all)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Cache progress log
+        uses: actions/cache@v4
+        with:
+          path: output/moviebox_progress.jsonl
+          key: moviebox-progress-${{ github.run_id }}
+          restore-keys: |
+            moviebox-progress-
+
+      - name: Run scraper
+        run: python moviebox_TUI_scraper.py --max-titles "${{ github.event.inputs.max_titles || '0' }}"
+
+      - name: Commit and push JSON chunks
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A output/catalog_part_*.json output/index.json
+          if git diff --staged --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "chore: update catalog JSON chunks"
+            git push
+          fi
